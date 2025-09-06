@@ -1,26 +1,42 @@
 <?php
 /**
  * Plugin Name: Goodwaty Attendance
- * Description: حضور وانصراف المتدربين باستخدام QR Code ديناميكي + تحقق من الموقع.
- * Version: 1.0.3
+ * Description: حضور وانصراف المتدربين باستخدام QR Code ديناميكي + تحقق من الموقع + تقرير يومي.
+ * Version: 1.0.4
  * Author: Yahya Bakr
  */
 
 if ( ! defined( 'ABSPATH' ) ) exit;
 
-/**
- * Shortcode لعرض QR Code
- */
+/*------------------------------
+  Helpers
+------------------------------*/
+function goodwaty_json_success($data = []) {
+    wp_send_json( array_merge(['success' => true], $data) );
+}
+function goodwaty_json_error($message = 'Error', $data = []) {
+    wp_send_json( array_merge(['success' => false, 'message' => $message], $data) );
+}
+
+/*------------------------------
+  QR Shortcode (with auto-refresh)
+  [goodwaty_qr type="attendance|leave" expires="70"]
+------------------------------*/
 function goodwaty_generate_qr_shortcode($atts) {
     global $wpdb;
 
-    $expires_in_seconds = 120;
-    $remaining = $expires_in_seconds - (time() % $expires_in_seconds);
-    $token = hash('sha256', time() . wp_rand());
+    $atts = shortcode_atts([
+        'type'    => 'attendance',
+        'expires' => '70', // ثواني
+    ], $atts);
 
-    $table_name = $wpdb->prefix . "goodwaty_tokens";
+    $type = in_array($atts['type'], ['attendance','leave']) ? $atts['type'] : 'attendance';
+    $expires_in_seconds = max(20, intval($atts['expires'])); // أضمن حد أدنى 20 ثانية
+
+    // إنشاء جدول التوكينات لو مش موجود
+    $table_tokens = $wpdb->prefix . "goodwaty_tokens";
     $wpdb->query("
-        CREATE TABLE IF NOT EXISTS $table_name (
+        CREATE TABLE IF NOT EXISTS $table_tokens (
             id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             token VARCHAR(255) NOT NULL,
             created_at DATETIME NOT NULL,
@@ -28,43 +44,105 @@ function goodwaty_generate_qr_shortcode($atts) {
         ) DEFAULT CHARSET=utf8mb4;
     ");
 
-    $wpdb->insert($table_name, array(
+    // توكين أولي لعرض أول QR
+    $token = hash('sha256', time() . wp_rand());
+    $wpdb->insert($table_tokens, [
         'token' => $token,
         'created_at' => current_time('mysql')
-    ));
+    ]);
 
-    $url = site_url("/checkin/?token=" . $token . "&type=attendance");
-    $qr_api = "https://api.qrserver.com/v1/create-qr-code/?size=200x200&data=" . urlencode($url);
+    $url    = site_url("/checkin/?token=" . $token . "&type=" . $type);
+    $qr_api = "https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=" . urlencode($url);
+    $remaining = $expires_in_seconds - (time() % $expires_in_seconds);
 
-    ob_start();
-    ?>
-    <div style="text-align:center; margin:20px;">
-        <h3>امسح الكود للتسجيل</h3>
-        <img src="<?php echo esc_url($qr_api); ?>" alt="QR Code" />
-        <p>سيتغير الكود بعد: <strong><?php echo $remaining; ?> ثانية</strong></p>
+    ob_start(); ?>
+    <div class="goodwaty-qr-wrap" style="text-align:center; margin:20px;">
+        <h3><?php echo ($type === 'leave') ? 'امسح الكود لتسجيل الانصراف' : 'امسح الكود لتسجيل الحضور'; ?></h3>
+        <img id="goodwaty-qr-img" src="<?php echo esc_url($qr_api); ?>" alt="QR Code" />
+        <p>سيتغير الكود بعد: <strong id="goodwaty-qr-count"><?php echo intval($remaining); ?></strong> ثانية</p>
     </div>
+    <script>
+    (function(){
+        var expires = <?php echo intval($expires_in_seconds); ?>;
+        var type    = <?php echo json_encode($type); ?>;
+        var counter = document.getElementById('goodwaty-qr-count');
+        var img     = document.getElementById('goodwaty-qr-img');
+
+        function tick(){
+            var val = parseInt(counter.textContent, 10);
+            if (val <= 1) {
+                refreshQR();
+            } else {
+                counter.textContent = (val - 1).toString();
+            }
+        }
+
+        function refreshQR(){
+            // نطلب توكين جديد عبر AJAX
+            var xhr = new XMLHttpRequest();
+            xhr.open('POST', <?php echo json_encode(admin_url('admin-ajax.php')); ?>, true);
+            xhr.setRequestHeader('Content-Type','application/x-www-form-urlencoded');
+            xhr.onload = function(){
+                try {
+                    var res = JSON.parse(xhr.responseText);
+                    if (res.success && res.qr_url) {
+                        img.src = res.qr_url + '&_cb=' + Date.now(); // منع الكاش
+                        counter.textContent = expires.toString();
+                    }
+                } catch(e) {}
+            };
+            xhr.send('action=goodwaty_new_qr&nonce=<?php echo wp_create_nonce('goodwaty_new_qr'); ?>&type=' + encodeURIComponent(type));
+        }
+
+        setInterval(tick, 1000);
+    })();
+    </script>
     <?php
     return ob_get_clean();
 }
 add_shortcode('goodwaty_qr', 'goodwaty_generate_qr_shortcode');
 
+/*------------------------------
+  AJAX: إصدار توكين/QR جديد بدون إعادة تحميل
+------------------------------*/
+function goodwaty_new_qr_ajax() {
+    if ( ! isset($_POST['nonce']) || ! wp_verify_nonce($_POST['nonce'], 'goodwaty_new_qr') ) {
+        goodwaty_json_error('Bad nonce');
+    }
+    $type = (isset($_POST['type']) && in_array($_POST['type'], ['attendance','leave'])) ? sanitize_text_field($_POST['type']) : 'attendance';
 
-/**
- * صفحة التحقق من QR (checkin)
- */
+    global $wpdb;
+    $table_tokens = $wpdb->prefix . "goodwaty_tokens";
+    $token = hash('sha256', time() . wp_rand());
+
+    $wpdb->insert($table_tokens, [
+        'token' => $token,
+        'created_at' => current_time('mysql')
+    ]);
+
+    $url    = site_url("/checkin/?token=" . $token . "&type=" . $type);
+    $qr_api = "https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=" . urlencode($url);
+
+    goodwaty_json_success(['qr_url' => $qr_api]);
+}
+add_action('wp_ajax_goodwaty_new_qr', 'goodwaty_new_qr_ajax');
+add_action('wp_ajax_nopriv_goodwaty_new_qr', 'goodwaty_new_qr_ajax');
+
+/*------------------------------
+  صفحة التحقق (checkin) + geofence
+------------------------------*/
 function goodwaty_checkin_page() {
     global $wpdb;
 
     $token = isset($_GET['token']) ? sanitize_text_field($_GET['token']) : '';
-    $type  = isset($_GET['type']) ? sanitize_text_field($_GET['type']) : 'attendance';
+    $type  = isset($_GET['type'])  ? sanitize_text_field($_GET['type'])  : 'attendance';
 
-    if (empty($token)) {
-        return "<p>⚠️ رابط غير صالح.</p>";
-    }
+    if (empty($token)) return "<p>⚠️ رابط غير صالح.</p>";
 
     $table_tokens = $wpdb->prefix . "goodwaty_tokens";
     $table_logs   = $wpdb->prefix . "goodwaty_attendance";
 
+    // جدول الحضور
     $wpdb->query("
         CREATE TABLE IF NOT EXISTS $table_logs (
             id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
@@ -78,48 +156,42 @@ function goodwaty_checkin_page() {
         ) DEFAULT CHARSET=utf8mb4;
     ");
 
+    // صلاحية التوكين آخر دقيقتين
     $row = $wpdb->get_row(
         $wpdb->prepare("SELECT * FROM $table_tokens WHERE token = %s AND created_at >= (NOW() - INTERVAL 2 MINUTE)", $token),
         ARRAY_A
     );
+    if (!$row) return "<p>⚠️ التوكين غير صالح أو منتهي.</p>";
 
-    if (!$row) {
-        return "<p>⚠️ التوكين غير صالح أو منتهي.</p>";
-    }
-
+    // معالجة الفورم
     if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_POST['phone'])) {
         $phone = sanitize_text_field($_POST['phone']);
-        $lat   = isset($_POST['latitude']) ? sanitize_text_field($_POST['latitude']) : '';
+        $lat   = isset($_POST['latitude'])  ? sanitize_text_field($_POST['latitude'])  : '';
         $lng   = isset($_POST['longitude']) ? sanitize_text_field($_POST['longitude']) : '';
+        if (empty($phone)) return "<p>⚠️ يجب إدخال رقم الهاتف.</p>";
 
-        if (empty($phone)) {
-            return "<p>⚠️ يجب إدخال رقم الهاتف.</p>";
-        }
-
+        // تحقق أن الهاتف موجود في المتدربين
         $table_students = $wpdb->prefix . "goodwaty_students";
         $student = $wpdb->get_row(
             $wpdb->prepare("SELECT * FROM $table_students WHERE phone = %s", $phone),
             ARRAY_A
         );
+        if (!$student) return "<p>⚠️ هذا الرقم غير مسجل في قائمة المتدربين.</p>";
 
-        if (!$student) {
-            return "<p>⚠️ هذا الرقم غير مسجل في قائمة المتدربين.</p>";
-        }
-
-        $wpdb->insert($table_logs, array(
-            'phone' => $phone,
-            'token' => $token,
-            'type'  => $type,
-            'latitude' => $lat,
-            'longitude' => $lng,
+        // سجّل
+        $wpdb->insert($table_logs, [
+            'phone'      => $phone,
+            'token'      => $token,
+            'type'       => in_array($type, ['attendance','leave']) ? $type : 'attendance',
+            'latitude'   => $lat,
+            'longitude'  => $lng,
             'created_at' => current_time('mysql')
-        ));
+        ]);
 
-        return "<p>✅ تم تسجيل $type بنجاح للرقم: <strong>$phone</strong></p>";
+        return "<p>✅ تم تسجيل " . ( $type === 'leave' ? 'الانصراف' : 'الحضور' ) . " بنجاح للرقم: <strong>" . esc_html($phone) . "</strong></p>";
     }
 
-    ob_start();
-    ?>
+    ob_start(); ?>
     <h3>تسجيل <?php echo ($type === 'leave') ? 'انصراف' : 'حضور'; ?></h3>
     <form method="post" id="attendanceForm" onsubmit="return checkLocation(this);">
         <label>رقم الهاتف:</label><br/>
@@ -138,43 +210,30 @@ function goodwaty_checkin_page() {
                 const userLat = position.coords.latitude;
                 const userLng = position.coords.longitude;
 
-                // 📍 جمعية البر بالباحة
-                // const hallLat = 20.0108358;
-                // const hallLng = 41.4676247;
-
-                  const hallLat = 30.1331151;
+                // ✳️ عدّل الإحداثيات حسب مكان الدورة (القيمة الحالية وضعتها كما أرسلتها سابقًا)
+                const hallLat = 30.1331151;
                 const hallLng = 31.2764006;
 
-                const distance = getDistance(userLat, userLng, hallLat, hallLng);
-
-                if (distance <= 100) { // 100 متر
-                    document.getElementById('latitude').value = userLat;
+                const distance = getDistance(userLat, userLng, hallLat, hallLng); // بالمتر
+                if (distance <= 100) {
+                    document.getElementById('latitude').value  = userLat;
                     document.getElementById('longitude').value = userLng;
                     form.submit();
                 } else {
-                    alert("❌ يجب أن تكون داخل مكان الحضور (جمعية البر بالباحة) لتأكيد تسجيلك");
+                    alert("❌ يجب أن تكون داخل مكان الحضور لتأكيد تسجيلك");
                 }
-            }, function(error) {
+            }, function() {
                 alert("⚠️ لم يتم السماح بالوصول للموقع");
             });
             return false;
         }
         return true;
     }
-
     function getDistance(lat1, lon1, lat2, lon2) {
-        const R = 6371e3;
-        const toRad = (deg) => deg * Math.PI / 180;
-
-        const dLat = toRad(lat2 - lat1);
-        const dLon = toRad(lon2 - lon1);
-        const a =
-            Math.sin(dLat/2) * Math.sin(dLat/2) +
-            Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) *
-            Math.sin(dLon/2) * Math.sin(dLon/2);
-
-        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
-        return R * c;
+        const R = 6371e3, toRad = d => d * Math.PI / 180;
+        const dLat = toRad(lat2 - lat1), dLon = toRad(lon2 - lon1);
+        const a = Math.sin(dLat/2)**2 + Math.cos(toRad(lat1))*Math.cos(toRad(lat2))*Math.sin(dLon/2)**2;
+        return 2*R*Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
     }
     </script>
     <?php
@@ -182,48 +241,118 @@ function goodwaty_checkin_page() {
 }
 add_shortcode('goodwaty_checkin', 'goodwaty_checkin_page');
 
-
-/**
- * إنشاء جدول المتدربين عند التفعيل
- */
+/*------------------------------
+  تهيئة جدول المتدربين
+------------------------------*/
 register_activation_hook(__FILE__, function() {
     global $wpdb;
     $charset = $wpdb->get_charset_collate();
-
     $table_students = $wpdb->prefix . "goodwaty_students";
     $wpdb->query("
         CREATE TABLE IF NOT EXISTS $table_students (
             id BIGINT(20) UNSIGNED NOT NULL AUTO_INCREMENT,
             name VARCHAR(100) NOT NULL,
             phone VARCHAR(20) NOT NULL,
-            PRIMARY KEY (id)
+            PRIMARY KEY (id),
+            UNIQUE KEY phone_unique (phone)
         ) $charset;
     ");
 });
 
-
-/**
- * تقرير الحضور
- */
-function goodwaty_report_page() {
+/*------------------------------
+  تقرير الحضور (ملخص يومي + تفصيلي)
+  [goodwaty_report from="2025-09-07" to="2025-09-11"]
+------------------------------*/
+function goodwaty_report_page($atts = []) {
     global $wpdb;
-    $table_logs = $wpdb->prefix . "goodwaty_attendance";
+    $atts = shortcode_atts([
+        'from' => '',
+        'to'   => '',
+    ], $atts);
+
+    $table_logs     = $wpdb->prefix . "goodwaty_attendance";
     $table_students = $wpdb->prefix . "goodwaty_students";
 
-    $rows = $wpdb->get_results("
-        SELECT l.id, s.name, l.phone, l.type, l.latitude, l.longitude, l.created_at
-        FROM $table_logs l
-        LEFT JOIN $table_students s ON l.phone = s.phone
-        ORDER BY l.created_at DESC
-    ", ARRAY_A);
-
-    if (!$rows) {
-        return "<p>⚠️ لا توجد سجلات حتى الآن.</p>";
+    // فلترة بالتواريخ (اختياري)
+    $where = "1=1";
+    $params = [];
+    if (!empty($atts['from'])) {
+        $where .= " AND DATE(l.created_at) >= %s";
+        $params[] = $atts['from'];
+    }
+    if (!empty($atts['to'])) {
+        $where .= " AND DATE(l.created_at) <= %s";
+        $params[] = $atts['to'];
     }
 
-    ob_start();
-    ?>
-    <h3>تقرير الحضور والانصراف</h3>
+    // ملخّص يومي: أول حضور وآخر انصراف لكل رقم/يوم
+    $sqlSummary = "
+        SELECT 
+            s.name,
+            l.phone,
+            DATE(l.created_at) AS day,
+            MIN(CASE WHEN l.type='attendance' THEN l.created_at END) AS first_checkin,
+            MAX(CASE WHEN l.type='leave' THEN l.created_at END)      AS last_checkout
+        FROM $table_logs l
+        LEFT JOIN $table_students s ON l.phone = s.phone
+        WHERE $where
+        GROUP BY l.phone, DATE(l.created_at), s.name
+        ORDER BY day DESC, s.name ASC
+    ";
+    $summaryRows = $params ? $wpdb->get_results( $wpdb->prepare($sqlSummary, $params), ARRAY_A )
+                           : $wpdb->get_results( $sqlSummary, ARRAY_A );
+
+    // السجل التفصيلي
+    $sqlDetail = "
+        SELECT s.name, l.phone, l.type, l.latitude, l.longitude, l.created_at
+        FROM $table_logs l
+        LEFT JOIN $table_students s ON l.phone = s.phone
+        WHERE $where
+        ORDER BY l.created_at DESC
+    ";
+    $detailRows = $params ? $wpdb->get_results( $wpdb->prepare($sqlDetail, $params), ARRAY_A )
+                          : $wpdb->get_results( $sqlDetail, ARRAY_A );
+
+    if (!$summaryRows && !$detailRows) {
+        return "<p>⚠️ لا توجد سجلات حتى الآن ضمن النطاق المحدد.</p>";
+    }
+
+    ob_start(); ?>
+    <h3>ملخّص الحضور/الانصراف اليومي</h3>
+    <table cellpadding="8" cellspacing="0" style="width:100%; border-collapse:collapse; margin-bottom:20px;">
+        <thead>
+            <tr>
+                <th>التاريخ</th>
+                <th>الاسم</th>
+                <th>رقم الهاتف</th>
+                <th>أول حضور</th>
+                <th>آخر انصراف</th>
+                <th>المدة (ساعات)</th>
+            </tr>
+        </thead>
+        <tbody>
+        <?php foreach ($summaryRows as $r):
+            $duration = '-';
+            if (!empty($r['first_checkin']) && !empty($r['last_checkout'])) {
+                $start = strtotime($r['first_checkin']);
+                $end   = strtotime($r['last_checkout']);
+                if ($end > $start) {
+                    $duration = round( ($end - $start) / 3600, 2 );
+                }
+            } ?>
+            <tr>
+                <td><?php echo esc_html($r['day']); ?></td>
+                <td><?php echo esc_html($r['name']); ?></td>
+                <td><?php echo esc_html($r['phone']); ?></td>
+                <td><?php echo $r['first_checkin'] ? esc_html($r['first_checkin']) : '-'; ?></td>
+                <td><?php echo $r['last_checkout'] ? esc_html($r['last_checkout']) : '-'; ?></td>
+                <td><?php echo is_numeric($duration) ? $duration : '-'; ?></td>
+            </tr>
+        <?php endforeach; ?>
+        </tbody>
+    </table>
+
+    <h3>السجل التفصيلي</h3>
     <table cellpadding="8" cellspacing="0" style="width:100%; border-collapse:collapse;">
         <thead>
             <tr>
@@ -235,14 +364,14 @@ function goodwaty_report_page() {
             </tr>
         </thead>
         <tbody>
-        <?php foreach ($rows as $row): ?>
+        <?php foreach ($detailRows as $row): ?>
             <tr>
                 <td><?php echo esc_html($row['name']); ?></td>
                 <td><?php echo esc_html($row['phone']); ?></td>
                 <td><?php echo ($row['type'] === 'leave') ? 'انصراف' : 'حضور'; ?></td>
                 <td><?php echo esc_html($row['created_at']); ?></td>
                 <td>
-                    <?php if ($row['latitude'] && $row['longitude']): ?>
+                    <?php if (!empty($row['latitude']) && !empty($row['longitude'])): ?>
                         <a href="https://maps.google.com/?q=<?php echo $row['latitude']; ?>,<?php echo $row['longitude']; ?>" target="_blank">عرض الموقع</a>
                     <?php else: ?>- <?php endif; ?>
                 </td>
@@ -255,10 +384,9 @@ function goodwaty_report_page() {
 }
 add_shortcode('goodwaty_report', 'goodwaty_report_page');
 
-
-/**
- * منيو لوحة التحكم
- */
+/*------------------------------
+  منيو لوحة التحكم + تقرير داخل الأدمن
+------------------------------*/
 add_action('admin_menu', function() {
     add_menu_page(
         'الحضور',
@@ -287,25 +415,29 @@ add_action('admin_menu', function() {
         'goodwaty-report',
         'goodwaty_report_admin_page'
     );
+
+    add_submenu_page(
+        'goodwaty-attendance',
+        'استيراد المتدربين',
+        'استيراد المتدربين',
+        'manage_options',
+        'goodwaty-attendance-import',
+        'goodwaty_attendance_import_page'
+    );
 });
 
-
-/**
- * صفحة إدارة المتدربين
- */
+/*------------------------------
+  صفحة إدارة المتدربين (بدون تغيير جوهري)
+------------------------------*/
 function goodwaty_students_page() {
     global $wpdb;
     $table_students = $wpdb->prefix . "goodwaty_students";
 
     if (isset($_POST['add_student'])) {
         $name  = sanitize_text_field($_POST['name']);
-        $phone = sanitize_text_field($_POST['phone']);
-
+        $phone = preg_replace('/\D/','', sanitize_text_field($_POST['phone'])); // أرقام فقط
         if (!empty($name) && !empty($phone)) {
-            $wpdb->insert($table_students, [
-                'name'  => $name,
-                'phone' => $phone
-            ]);
+            $wpdb->insert($table_students, ['name'=>$name, 'phone'=>$phone]);
             echo '<div class="updated"><p>✅ تم إضافة المتدرب.</p></div>';
         }
     }
@@ -361,40 +493,28 @@ function goodwaty_students_page() {
     <?php
 }
 
-
-/**
- * صفحة التقرير داخل لوحة التحكم
- */
+/*------------------------------
+  صفحة التقرير داخل لوحة التحكم
+------------------------------*/
 function goodwaty_report_admin_page() {
     echo '<div class="wrap"><h1>تقرير الحضور</h1>';
     echo do_shortcode('[goodwaty_report]');
     echo '</div>';
 }
 
-
-
-
-// صفحة استيراد المتدربين
-add_action('admin_menu', function () {
-    add_submenu_page(
-        'goodwaty-attendance',
-        'استيراد المتدربين',
-        'استيراد المتدربين',
-        'manage_options',
-        'goodwaty-attendance-import',
-        'goodwaty_attendance_import_page'
-    );
-});
-
+/*------------------------------
+  استيراد المتدربين (CSV: الاسم,رقم الجوال)
+------------------------------*/
 function goodwaty_attendance_import_page() {
     global $wpdb;
     $table = $wpdb->prefix . "goodwaty_students";
 
     if (isset($_POST['submit']) && !empty($_FILES['import_file']['tmp_name'])) {
         $file = fopen($_FILES['import_file']['tmp_name'], 'r');
-        $row = 0;
-        $added = 0;
-        while (($data = fgetcsv($file, 1000, ",")) !== FALSE || ($data = fgetcsv($file, 1000, ";")) !== FALSE) {
+        $row = 0; $added = 0;
+
+        // قراءة CSV مفصول بفاصلة. (لو عندك ; بدّل في الإكسيل إلى , عند الحفظ)
+        while (($data = fgetcsv($file, 1000, ",")) !== FALSE) {
             if ($row == 0) { $row++; continue; } // تخطي الهيدر
             if (empty($data[0]) || empty($data[1])) { continue; }
 
@@ -404,23 +524,19 @@ function goodwaty_attendance_import_page() {
             if (!empty($name) && !empty($phone)) {
                 $exists = $wpdb->get_var($wpdb->prepare("SELECT id FROM $table WHERE phone = %s", $phone));
                 if (!$exists) {
-                    $wpdb->insert($table, [
-                        'name' => $name,
-                        'phone' => $phone,
-                        
-                    ]);
+                    $wpdb->insert($table, ['name' => $name, 'phone' => $phone]);
                     $added++;
                 }
             }
             $row++;
         }
         fclose($file);
-
-        echo '<div class="updated"><p>✅ تم استيراد ' . $added . ' متدرب بنجاح!</p></div>';
+        echo '<div class="updated"><p>✅ تم استيراد ' . intval($added) . ' متدرب بنجاح!</p></div>';
     }
     ?>
     <div class="wrap">
         <h1>استيراد المتدربين من CSV</h1>
+        <p>صيغة الأعمدة: <code>الاسم,رقم الجوال</code></p>
         <form method="post" enctype="multipart/form-data">
             <input type="file" name="import_file" accept=".csv" required>
             <br><br>
@@ -429,4 +545,3 @@ function goodwaty_attendance_import_page() {
     </div>
     <?php
 }
-
