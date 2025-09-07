@@ -211,8 +211,11 @@ function goodwaty_checkin_page() {
                 const userLng = position.coords.longitude;
 
                 // ✳️ عدّل الإحداثيات حسب مكان الدورة (القيمة الحالية وضعتها كما أرسلتها سابقًا)
-                const hallLat = 30.1331151;
-                const hallLng = 31.2764006;
+                         // 📍 جمعية البر بالباحة
+                const hallLat = 20.0108358;
+                const hallLng = 41.4676247;
+                // const hallLat = 30.1331151;
+                // const hallLng = 31.2764006;
 
                 const distance = getDistance(userLat, userLng, hallLat, hallLng); // بالمتر
                 if (distance <= 100) {
@@ -220,7 +223,7 @@ function goodwaty_checkin_page() {
                     document.getElementById('longitude').value = userLng;
                     form.submit();
                 } else {
-                    alert("❌ يجب أن تكون داخل مكان الحضور لتأكيد تسجيلك");
+                    alert("❌ يجب أن تكون داخل مكان الحضور( جمعية البر بالباحة) لتأكيد تسجيلك");
                 }
             }, function() {
                 alert("⚠️ لم يتم السماح بالوصول للموقع");
@@ -259,67 +262,102 @@ register_activation_hook(__FILE__, function() {
     ");
 });
 
+
+
 /*------------------------------
   تقرير الحضور (ملخص يومي + تفصيلي)
   [goodwaty_report from="2025-09-07" to="2025-09-11"]
 ------------------------------*/
 function goodwaty_report_page($atts = []) {
     global $wpdb;
+
     $atts = shortcode_atts([
         'from' => '',
         'to'   => '',
+        'student' => 0
     ], $atts);
 
     $table_logs     = $wpdb->prefix . "goodwaty_attendance";
     $table_students = $wpdb->prefix . "goodwaty_students";
 
-    // فلترة بالتواريخ (اختياري)
-    $where = "1=1";
+    $from    = sanitize_text_field($_GET['from'] ?? $atts['from']);
+    $to      = sanitize_text_field($_GET['to'] ?? $atts['to']);
+    $student = intval($_GET['student'] ?? $atts['student']);
+
+    $where_sql = '1=1';
     $params = [];
-    if (!empty($atts['from'])) {
-        $where .= " AND DATE(l.created_at) >= %s";
-        $params[] = $atts['from'];
-    }
-    if (!empty($atts['to'])) {
-        $where .= " AND DATE(l.created_at) <= %s";
-        $params[] = $atts['to'];
+
+    if ($from && $to) {
+        $where_sql = 'DATE(l.created_at) BETWEEN %s AND %s';
+        $params = [$from, $to];
+    } elseif ($from) {
+        $where_sql = 'DATE(l.created_at) >= %s';
+        $params = [$from];
+    } elseif ($to) {
+        $where_sql = 'DATE(l.created_at) <= %s';
+        $params = [$to];
     }
 
-    // ملخّص يومي: أول حضور وآخر انصراف لكل رقم/يوم
+    if ($student) {
+        $where_sql .= ' AND s.id = %d';
+        $params[] = $student;
+    }
+
+    // ====== بيانات الملخص ======
     $sqlSummary = "
-        SELECT 
-            s.name,
+        SELECT
+            COALESCE(s.name,'-') AS name,
             l.phone,
             DATE(l.created_at) AS day,
             MIN(CASE WHEN l.type='attendance' THEN l.created_at END) AS first_checkin,
-            MAX(CASE WHEN l.type='leave' THEN l.created_at END)      AS last_checkout
+            MAX(CASE WHEN l.type='leave' THEN l.created_at END) AS last_checkout
         FROM $table_logs l
-        LEFT JOIN $table_students s ON l.phone = s.phone
-        WHERE $where
+        LEFT JOIN $table_students s
+            ON TRIM(l.phone) = TRIM(s.phone) COLLATE utf8mb4_general_ci
+        WHERE $where_sql
         GROUP BY l.phone, DATE(l.created_at), s.name
-        ORDER BY day DESC, s.name ASC
+        ORDER BY day DESC, name ASC
     ";
-    $summaryRows = $params ? $wpdb->get_results( $wpdb->prepare($sqlSummary, $params), ARRAY_A )
-                           : $wpdb->get_results( $sqlSummary, ARRAY_A );
+    $summaryRows = $params ? $wpdb->get_results($wpdb->prepare($sqlSummary, ...$params), ARRAY_A) : $wpdb->get_results($sqlSummary, ARRAY_A);
 
-    // السجل التفصيلي
+    // ====== بيانات السجل التفصيلي ======
     $sqlDetail = "
-        SELECT s.name, l.phone, l.type, l.latitude, l.longitude, l.created_at
+        SELECT COALESCE(s.name,'-') AS name, l.phone, l.type, l.latitude, l.longitude, l.created_at
         FROM $table_logs l
-        LEFT JOIN $table_students s ON l.phone = s.phone
-        WHERE $where
+        LEFT JOIN $table_students s
+            ON TRIM(l.phone) = TRIM(s.phone) COLLATE utf8mb4_general_ci
+        WHERE $where_sql
         ORDER BY l.created_at DESC
     ";
-    $detailRows = $params ? $wpdb->get_results( $wpdb->prepare($sqlDetail, $params), ARRAY_A )
-                          : $wpdb->get_results( $sqlDetail, ARRAY_A );
-
-    if (!$summaryRows && !$detailRows) {
-        return "<p>⚠️ لا توجد سجلات حتى الآن ضمن النطاق المحدد.</p>";
-    }
+    $detailRows = $params ? $wpdb->get_results($wpdb->prepare($sqlDetail, ...$params), ARRAY_A) : $wpdb->get_results($sqlDetail, ARRAY_A);
 
     ob_start(); ?>
+
+    <!-- ====== نموذج الفلتر ====== -->
+    <form method="get" style="margin-bottom:20px;">
+        <input type="hidden" name="page" value="goodwaty-report">
+        <label>من: <input type="date" name="from" value="<?php echo esc_attr($from); ?>"></label>
+        <label>إلى: <input type="date" name="to" value="<?php echo esc_attr($to); ?>"></label>
+        <label>طالب: 
+            <select name="student">
+                <option value="0">الكل</option>
+                <?php 
+                $students = $wpdb->get_results("SELECT id,name FROM $table_students ORDER BY name ASC", ARRAY_A);
+                foreach ($students as $s): ?>
+                    <option value="<?php echo $s['id']; ?>" <?php selected($student, $s['id']); ?>><?php echo esc_html($s['name']); ?></option>
+                <?php endforeach; ?>
+            </select>
+        </label>
+        <button type="submit" class="button button-primary">فلترة</button>
+        <a href="<?php echo admin_url('admin-post.php?action=export_goodwaty_csv&from='.urlencode($from).'&to='.urlencode($to).'&student='.$student); ?>" class="button button-secondary">⬇️ تصدير CSV</a>
+    </form>
+
+    <!-- ====== شارت الحضور ====== -->
+    <canvas id="attendanceChart" style="max-width:600px; margin-bottom:30px;"></canvas>
+
+    <!-- ====== جدول الملخص ====== -->
     <h3>ملخّص الحضور/الانصراف اليومي</h3>
-    <table cellpadding="8" cellspacing="0" style="width:100%; border-collapse:collapse; margin-bottom:20px;">
+    <table border="1" cellpadding="8" cellspacing="0" style="width:100%; border-collapse:collapse; margin-bottom:20px;">
         <thead>
             <tr>
                 <th>التاريخ</th>
@@ -336,9 +374,7 @@ function goodwaty_report_page($atts = []) {
             if (!empty($r['first_checkin']) && !empty($r['last_checkout'])) {
                 $start = strtotime($r['first_checkin']);
                 $end   = strtotime($r['last_checkout']);
-                if ($end > $start) {
-                    $duration = round( ($end - $start) / 3600, 2 );
-                }
+                if ($end > $start) $duration = round( ($end - $start) / 3600, 2 );
             } ?>
             <tr>
                 <td><?php echo esc_html($r['day']); ?></td>
@@ -352,8 +388,9 @@ function goodwaty_report_page($atts = []) {
         </tbody>
     </table>
 
+    <!-- ====== السجل التفصيلي ====== -->
     <h3>السجل التفصيلي</h3>
-    <table cellpadding="8" cellspacing="0" style="width:100%; border-collapse:collapse;">
+    <table border="1" cellpadding="8" cellspacing="0" style="width:100%; border-collapse:collapse;">
         <thead>
             <tr>
                 <th>الاسم</th>
@@ -379,10 +416,53 @@ function goodwaty_report_page($atts = []) {
         <?php endforeach; ?>
         </tbody>
     </table>
+
+    <!-- ====== شارت.js ====== -->
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <script>
+        const ctx = document.getElementById('attendanceChart').getContext('2d');
+        const attendanceData = <?php 
+            $chart = [];
+            foreach ($summaryRows as $r) {
+                if (!isset($chart[$r['day']])) $chart[$r['day']] = 0;
+                $chart[$r['day']]++;
+            }
+            echo json_encode(array_values($chart));
+        ?>;
+        const attendanceLabels = <?php echo json_encode(array_keys($chart)); ?>;
+        new Chart(ctx, {
+            type: 'bar',
+            data: {
+                labels: attendanceLabels,
+                datasets: [{
+                    label: 'عدد الحضور لكل يوم',
+                    data: attendanceData,
+                    backgroundColor: 'rgba(54, 162, 235, 0.6)',
+                    borderColor: 'rgba(54, 162, 235, 1)',
+                    borderWidth: 1
+                }]
+            },
+            options: {
+                responsive:true,
+                plugins: {
+                    legend: { display:true },
+                    title: { display:true, text:'تقرير الحضور اليومي' }
+                },
+                scales: {
+                    y: { beginAtZero:true }
+                }
+            }
+        });
+    </script>
+
     <?php
     return ob_get_clean();
 }
+
+
 add_shortcode('goodwaty_report', 'goodwaty_report_page');
+
+
 
 /*------------------------------
   منيو لوحة التحكم + تقرير داخل الأدمن
