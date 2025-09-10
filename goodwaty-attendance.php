@@ -176,7 +176,7 @@ function goodwaty_checkin_page() {
             $wpdb->prepare("SELECT * FROM $table_students WHERE phone = %s", $phone),
             ARRAY_A
         );
-        if (!$student) return "<p>⚠️ هذا الرقم غير مسجل في قائمة المتدربين.</p>";
+        if (!$student) return "<p>⚠️ هذا الرقم  $phone غير مسجل في قائمة المتدربين.</p>";
 
         // submit log
         $wpdb->insert($table_logs, [
@@ -188,7 +188,7 @@ function goodwaty_checkin_page() {
             'created_at' => current_time('mysql')
         ]);
 
-        return "<p>✅ تم تسجيل " . ( $type === 'leave' ? 'الانصراف' : 'الحضور' ) . " بنجاح للرقم: <strong>" . esc_html($phone) . "</strong>أهلا وسهلا بك " . esc_html($student['name']) . "!</p>";
+return "<p>✅ أهلاً وسهلاً بك " . esc_html($student['name']) . " في مركز قيمة وقدوة للتدريب. تم تسجيل " . ( $type === 'leave' ? 'الانصراف' : 'الحضور' ) . " بنجاح في دورة إدارة المشاريع التنموية PMD Pro. رقم هاتفك هو: <strong>" . esc_html($phone) . "</strong>.</p>";
     }
 
     ob_start(); ?>
