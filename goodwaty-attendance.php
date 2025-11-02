@@ -188,7 +188,7 @@ function goodwaty_checkin_page() {
             'created_at' => current_time('mysql')
         ]);
 
-return "<p>✅ أهلاً وسهلاً بك " . esc_html($student['name']) . " في مركز قيمة وقدوة للتدريب. تم تسجيل " . ( $type === 'leave' ? 'الانصراف' : 'الحضور' ) . " بنجاح في دورة إدارة المشاريع التنموية PMD Pro. رقم هاتفك هو: <strong>" . esc_html($phone) . "</strong>.</p>";
+        return "<p>✅ أهلاً وسهلاً بك " . esc_html($student['name']) . " في مركز قيمة وقدوة للتدريب. تم تسجيل " . ( $type === 'leave' ? 'الانصراف' : 'الحضور' ) . " بنجاح في دورة إدارة المشاريع التنموية PMD Pro. رقم هاتفك هو: <strong>" . esc_html($phone) . "</strong>.</p>";
     }
 
     ob_start(); ?>
